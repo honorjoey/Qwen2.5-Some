@@ -1,62 +1,247 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers.trainer_utils import set_seed
+from threading import Thread
+import random
 import os
+import gradio as gr
 
-# 可调参数，建议在文本生成时设置为较高值
-TOP_P = 0.9        # Top-p (nucleus sampling)，范围0到1
-TOP_K = 80         # Top-k 采样的K值
-TEMPERATURE = 0.3  # 温度参数，控制生成文本的随机性
+# 默认参数
+DEFAULT_TOP_P = 0.9        # Top-p (nucleus sampling) 范围在0到1之间
+DEFAULT_TOP_K = 80         # Top-k 采样的K值
+DEFAULT_TEMPERATURE = 0.3  # 温度参数，控制生成文本的随机性
+DEFAULT_MAX_NEW_TOKENS = 512  # 生成的最大新令牌数
+DEFAULT_SYSTEM_MESSAGE = ""  # 默认系统消息
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# 检查是否有可用的 GPU，默认使用 GPU，如果不可用则使用 CPU
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    cpu_only = False
+    print("检测到 GPU，使用 GPU 进行推理。")
+else:
+    DEVICE = "cpu"
+    cpu_only = True
+    print("未检测到 GPU,使用 CPU 进行推理。")
 
-# 获取当前脚本目录，亦可改为绝对路径
-current_directory = os.path.dirname(os.path.abspath(__file__))
+# 使用 Hugging Face 模型 ID,如果本地没有模型文件会自动下载
+# 也可以改为本地路径,如果你已经下载了模型文件
+DEFAULT_CKPT_PATH = "ystemsrx/Qwen2.5-Sex"
 
-# 加载模型和分词器
-model = AutoModelForCausalLM.from_pretrained(
-    current_directory,
-    torch_dtype="auto",
-    device_map="auto"
-)
-tokenizer = AutoTokenizer.from_pretrained(current_directory)
+def _load_model_tokenizer(checkpoint_path, cpu_only):
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, resume_download=True)
 
-# 系统指令（建议为空）
-messages = [
-    {"role": "system", "content": ""}
-]
+    device_map = "cpu" if cpu_only else "auto"
 
-while True:
-    # 获取用户输入
-    user_input = input("User: ").strip()
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint_path,
+        torch_dtype=torch.float16 if not cpu_only else torch.float32,  # 使用更低的精度以节省显存
+        device_map=device_map,
+        resume_download=True,
+    ).eval()
 
-    # 添加用户输入到对话
-    messages.append({"role": "user", "content": user_input})
+    # 如果使用 GPU，确保模型使用半精度以节省显存（如果模型支持）
+    if not cpu_only and torch.cuda.is_available():
+        try:
+            model.half()
+            print("模型已切换为半精度（float16）。")
+        except:
+            print("无法切换模型为半精度，继续使用默认精度。")
 
-    # 准备输入文本
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(device)
+    model.generation_config.max_new_tokens = DEFAULT_MAX_NEW_TOKENS  # 设置生成的最大新令牌数
 
-    # 生成响应
-    generated_ids = model.generate(
-        model_inputs.input_ids,
-        max_new_tokens=512,
-        top_p=TOP_P,
-        top_k=TOP_K,
-        temperature=TEMPERATURE,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id  # 避免警告
-    )
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    return model, tokenizer
+
+def _chat_stream(model, tokenizer, query, history, system_message, top_p, top_k, temperature, max_new_tokens):
+    conversation = [
+        {'role': 'system', 'content': system_message},
     ]
+    for query_h, response_h in history:
+        conversation.append({'role': 'user', 'content': query_h})
+        conversation.append({'role': 'assistant', 'content': response_h})
+    conversation.append({'role': 'user', 'content': query})
+    
+    # 准备输入
+    try:
+        # 尝试使用 apply_chat_template 方法
+        text = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,               # 确保返回的是字符串
+            add_generation_prompt=True
+        )
+    except AttributeError:
+        # 如果没有 apply_chat_template 方法，使用标准方法构建对话
+        print("[WARNING] `apply_chat_template` 方法不存在，使用标准对话格式。")
+        text = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in conversation])
+        text += "\nAssistant:"
+    
+    # 确保 text 是字符串
+    if not isinstance(text, str):
+        raise ValueError("apply_chat_template 应返回字符串类型的文本。")
+    
+    # Tokenize 输入
+    inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+    
+    streamer = TextIteratorStreamer(tokenizer=tokenizer, skip_prompt=True, timeout=60.0, skip_special_tokens=True)
+    
+    # 生成参数
+    generation_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        max_new_tokens=max_new_tokens,
+        top_p=top_p,
+        top_k=top_k,
+        temperature=temperature,
+        do_sample=True,  # 确保使用采样方法
+        pad_token_id=tokenizer.eos_token_id,  # 避免警告
+        streamer=streamer,
+    )
+    
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
 
-    # 解码并打印响应
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    print(f"Assistant: {response}")
+    generated_text = ""
+    for new_text in streamer:
+        generated_text += new_text
+        yield new_text
+    return generated_text
 
-    # 将生成的响应添加到对话中
-    messages.append({"role": "assistant", "content": response})
+def initialize_model():
+    checkpoint_path = DEFAULT_CKPT_PATH
+    seed = random.randint(0, 2**32 - 1)  # 随机生成一个种子
+    set_seed(seed)  # 设置随机种子
+
+    model, tokenizer = _load_model_tokenizer(checkpoint_path, cpu_only)
+
+    return model, tokenizer
+
+# 初始化模型和分词器
+model, tokenizer = initialize_model()
+
+def chat_interface(user_input, history, system_message, top_p, top_k, temperature, max_new_tokens):
+    if user_input.strip() == "":
+        yield history, history, system_message, ""
+        return
+    
+    # 创建一个新的助手回复条目，初始为空
+    history.append((user_input, ""))
+    yield history, history, system_message, ""  # 更新 Chatbot 组件和状态
+
+    # 获取模型生成的回复
+    generator = _chat_stream(model, tokenizer, user_input, history[:-1], system_message, top_p, top_k, temperature, max_new_tokens)
+    assistant_reply = ""
+    for new_text in generator:
+        assistant_reply += new_text
+        # 更新最后一条助手回复
+        updated_history = history.copy()
+        updated_history[-1] = (user_input, assistant_reply)
+        yield updated_history, updated_history, system_message, ""  # 更新 Chatbot 组件和状态
+
+def clear_history():
+    return [], [], DEFAULT_SYSTEM_MESSAGE, ""
+
+# Gradio 接口
+with gr.Blocks() as demo:
+    # CSS
+    gr.HTML("""
+    <style>
+        #chat-container {
+            height: 500px;
+            overflow-y: auto;
+        }
+        .settings-column {
+            padding-left: 20px;
+            border-left: 1px solid #ddd;
+        }
+        .send-button {
+            margin-top: 10px;
+            width: 100%;
+        }
+    </style>
+    """)
+
+    gr.Markdown("# Qwen2.5 Sex")
+
+    with gr.Row():
+        # 左侧栏：聊天记录和用户输入
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(elem_id="chat-container")
+            user_input = gr.Textbox(
+                show_label=False, 
+                placeholder="输入你的问题...", 
+                lines=2,
+                interactive=True
+            )
+            send_btn = gr.Button("发送", elem_classes=["send-button"])
+        
+        # 右侧栏：清空历史按钮、系统消息输入框和生成参数滑块
+        with gr.Column(scale=1, elem_classes=["settings-column"]):
+            gr.Markdown("### 设置")
+            clear_btn = gr.Button("清空历史")
+            gr.Markdown("#### 系统消息")
+            system_message = gr.Textbox(
+                label="系统消息",
+                value=DEFAULT_SYSTEM_MESSAGE,
+                placeholder="输入系统消息...",
+                lines=2
+            )
+            gr.Markdown("#### 生成参数")
+            top_p_slider = gr.Slider(
+                minimum=0.1, maximum=1.0, value=DEFAULT_TOP_P, step=0.05,
+                label="Top-p (nucleus sampling)"
+            )
+            top_k_slider = gr.Slider(
+                minimum=0, maximum=100, value=DEFAULT_TOP_K, step=1,
+                label="Top-k"
+            )
+            temperature_slider = gr.Slider(
+                minimum=0.1, maximum=1.5, value=DEFAULT_TEMPERATURE, step=0.05,
+                label="Temperature"
+            )
+            max_new_tokens_slider = gr.Slider(
+                minimum=50, maximum=2048, value=DEFAULT_MAX_NEW_TOKENS, step=2,
+                label="Max New Tokens"
+            )
+
+    # 状态管理
+    state = gr.State([])
+
+    # 绑定事件
+    # 回车chat_interface
+    user_input.submit(
+        chat_interface, 
+        inputs=[user_input, state, system_message, top_p_slider, top_k_slider, temperature_slider, max_new_tokens_slider], 
+        outputs=[chatbot, state, system_message, user_input],
+        queue=True
+    )
+    # 发送chat_interface
+    send_btn.click(
+        chat_interface, 
+        inputs=[user_input, state, system_message, top_p_slider, top_k_slider, temperature_slider, max_new_tokens_slider], 
+        outputs=[chatbot, state, system_message, user_input],
+        queue=True
+    )
+    clear_btn.click(
+        clear_history, 
+        inputs=None, 
+        outputs=[chatbot, state, system_message, user_input],
+        queue=True
+    )
+
+    # JS
+    gr.HTML("""
+    <script>
+        function scrollChat() {
+            const chatContainer = document.getElementById('chat-container');
+            if(chatContainer) {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        }
+
+        const observer = new MutationObserver(scrollChat);
+        const chatContainer = document.getElementById('chat-container');
+        if(chatContainer) {
+            observer.observe(chatContainer, { childList: true, subtree: true });
+        }
+    </script>
+    """)
+
+demo.launch()
